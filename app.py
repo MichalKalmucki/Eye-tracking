@@ -61,6 +61,24 @@ class GazeApp(QWidget):
         layout.addLayout(h_layout)
         self.setLayout(layout)
 
+    
+        self.calibrated = False
+        self.calibration_points = [
+            QPoint(50, 50),  # top-left
+            QPoint(self.screen_label.width() - 50, 50),  # top-right
+            QPoint(50, self.screen_label.height() - 50),  # bottom-left
+            QPoint(self.screen_label.width() - 50, self.screen_label.height() - 50),  # bottom-right
+            QPoint(self.screen_label.width() // 2, self.screen_label.height() // 2)  # center
+        ]
+        self.current_calib_index = 0
+        self.calib_predictions = []
+        self.calib_timer = QTimer()
+        self.calib_timer.timeout.connect(self.collect_calib_data)
+        self.calib_timer.start(1000)
+        self.calib_dot_samples = []
+        self.x_offset = 0.0
+        self.y_offset = 0.0
+
         self.cap = cv2.VideoCapture(0)
         self.timer = QTimer()
         self.timer.timeout.connect(self.update)
@@ -96,6 +114,57 @@ class GazeApp(QWidget):
         painter.end()
         self.screen_label.setPixmap(pixmap)
 
+    def collect_calib_data(self):
+        if self.current_calib_index >= len(self.calibration_points):
+            self.apply_calibration()
+            return
+
+        ret, frame = self.cap.read()
+        if not ret:
+            return
+
+        eye_img = find_eyes(frame)
+        if eye_img is None:
+            return
+
+        pil_img = Image.fromarray(cv2.cvtColor(eye_img, cv2.COLOR_BGR2RGB))
+        input_tensor = transform(pil_img).unsqueeze(0)
+
+        with torch.no_grad():
+            output = model(input_tensor).squeeze().numpy()
+            self.calib_dot_samples.append(output)
+
+        # show calibration dot
+        self.dot_pos = self.calibration_points[self.current_calib_index]
+        self.paint_screen()
+
+        if len(self.calib_dot_samples) >= 5:
+            mean_pred = np.mean(self.calib_dot_samples, axis=0)
+            self.calib_predictions.append(mean_pred)
+            self.calib_dot_samples.clear()
+            self.current_calib_index += 1
+
+    def apply_calibration(self):
+        pred_xs = [p[0] for p in self.calib_predictions]
+        pred_ys = [p[1] for p in self.calib_predictions]
+        true_xs = [p.x() / self.screen_label.width() for p in self.calibration_points]
+        true_ys = [p.y() / self.screen_label.height() for p in self.calibration_points]
+
+        pred_range_x = max(pred_xs) - min(pred_xs)
+        pred_range_y = max(pred_ys) - min(pred_ys)
+        true_range_x = max(true_xs) - min(true_xs)
+        true_range_y = max(true_ys) - min(true_ys)
+
+        self.x_scale = true_range_x / pred_range_x if pred_range_x != 0 else 1.0
+        self.y_scale = true_range_y / pred_range_y if pred_range_y != 0 else 1.0
+
+        self.x_shift = min(true_xs) - self.x_scale * min(pred_xs)
+        self.y_shift = min(true_ys) - self.y_scale * min(pred_ys)
+
+        self.calibrated = True
+        self.calib_timer.stop()
+        self.timer.start(1000)
+
     def update(self):
         ret, frame = self.cap.read()
         if not ret:
@@ -117,10 +186,12 @@ class GazeApp(QWidget):
 
         with torch.no_grad():
             output = model(input_tensor).squeeze().numpy()
-            x_offset = 0.1 
-            y_offset = 1.25
-            output[0] = np.clip(output[0] + x_offset, 0, 1)
-            output[1] = np.clip(output[1] ** y_offset, 0, 1)
+            if not self.calibrated:
+                return  
+
+            output[0] = np.clip(output[0] * self.x_scale + self.x_shift, 0, 1)
+            output[1] = np.clip(output[1] * self.y_scale + self.y_shift, 0, 1)
+
             pred_x = int(output[0] * self.screen_label.width())
             pred_y = int(output[1] * self.screen_label.height())
             predicted_pos = QPoint(pred_x, pred_y)
